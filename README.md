@@ -21,8 +21,10 @@ fills in the image regions, leaving existing real text alone.
 
 ## Usage: execute these commands in Powershell
 
-```powershell (you can also run buildDocker.ps1, esp. if you have a HF_TOKEN and want to 
-speed up the download. NOTE: either way, you must have Docker Desktop installed)
+```powershell
+# (you can also run buildDocker.ps1, esp. if you have a HF_TOKEN and want to 
+# speed up the download (though, it’s really small). 
+# NOTE: either way, you must have Docker Desktop installed
 PS> docker build -t removepii .
 PS> docker run -p 8142:8142 removepii
 ```
