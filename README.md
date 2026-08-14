@@ -24,7 +24,7 @@ fills in the image regions, leaving existing real text alone.
 ```powershell
 # (you can also run buildDocker.ps1, esp. if you have a HF_TOKEN and want to 
 # speed up the download (though, it’s really small). 
-# NOTE: either way, you must have Docker Desktop installed
+# NOTE: either way, you must have Docker Desktop installed and running
 PS> docker build -t removepii .
 PS> docker run -p 8142:8142 removepii
 ```
@@ -36,6 +36,18 @@ PS> docker-compose up --build
 ```
 
 Then in a web browser, navigate to http://localhost:8142/
+
+If you just cloned the repo, you might also need:
+
+```powershell
+cd path\to\your\cloned-repo
+
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
 
 ## API
 
