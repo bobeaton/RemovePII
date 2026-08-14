@@ -1,0 +1,24 @@
+# Top-level secret sourced from a host environment variable -- requires a reasonably
+# recent Docker Compose (the `environment:`-sourced secret form). If your `docker-compose`
+# doesn't recognize this, update Docker Desktop, or just leave HF_TOKEN unset (it's
+# optional -- openai/privacy-filter is public).
+secrets:
+  hf_token:
+    environment: HF_TOKEN
+
+services:
+  removepii:
+    build:
+      context: .
+      secrets:
+        - hf_token
+        # Passed to the Dockerfile's `RUN --mount=type=secret,id=hf_token` step -- never
+        # written to any image layer. Optional; only has an effect if HF_TOKEN is set in
+        # your shell environment before running `docker-compose up --build`.
+    environment:
+      # Passed again at container runtime (server.py re-loads the model on every
+      # startup, separately from the build-time load in import_model.py above).
+      HF_TOKEN: ${HF_TOKEN:-}
+    ports:
+      - "8142:8142"
+    restart: unless-stopped

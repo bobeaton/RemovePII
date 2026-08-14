@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html>
+  <head>
+      <title>{{ MODEL_NAME }}</title>
+    <style>
+      html {
+        box-sizing: border-box;
+      }
+      *,
+      *:before,
+      *:after {
+        box-sizing: inherit;
+      }
+      body {
+        font-family: sans-serif;
+        max-width: 40em;
+        margin: 2em auto;
+        padding: 0 1em;
+      }
+      #uploadForm {
+        display: flex;
+        flex-direction: column;
+        gap: 0.75em;
+        border: 1px solid grey;
+        padding: 1em;
+      }
+      #result {
+        margin-top: 1em;
+        padding: 1em;
+        border: 1px solid grey;
+        display: none;
+      }
+      #result.visible {
+        display: block;
+      }
+      #error {
+        margin-top: 1em;
+        color: darkred;
+        display: none;
+      }
+      #error.visible {
+        display: block;
+      }
+      #endpoints {
+        font-family: monospace;
+      }
+      button {
+        font-size: 1rem;
+        width: fit-content;
+      }
+      #progress {
+        margin-top: 1em;
+        display: none;
+        align-items: center;
+        gap: 0.6em;
+      }
+      #progress.visible {
+        display: flex;
+      }
+      .spinner {
+        width: 1.2em;
+        height: 1.2em;
+        border: 0.2em solid #ccc;
+        border-top-color: #333;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        flex-shrink: 0;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      /* A spinning circle can itself look frozen if it silently stops (or to anyone
+         with motion sensitivity who has this OS setting on) -- the ticking elapsed-time
+         text in #progressText is the part that actually proves progress either way. */
+      @media (prefers-reduced-motion: reduce) {
+        .spinner {
+          animation: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+      <h1>{{ MODEL_NAME }}</h1>
+      <p>
+          This page will redact PII from an uploaded text or PDF file using the
+          {{ MODEL_NAME }} model. See
+          <a href="https://huggingface.co/{{ MODEL_NAME }}"
+             target="_blank">https://huggingface.co/{{ MODEL_NAME }}</a>.
+          Every detected item (names, emails, phone numbers, addresses, URLs, dates,
+          account numbers, credentials) is replaced with a placeholder. PDF pages with
+          no real text layer (scanned or flattened-to-image pages) are OCR'd first, so
+          PII baked into an image can still be found and redacted.
+      </p>
+
+      <form id="uploadForm">
+        <label for="fileInput">File to redact (.txt or .pdf)</label>
+        <input type="file" id="fileInput" name="file" accept=".txt,.pdf" required />
+
+        <label for="outputFormat">Output format</label>
+        <select id="outputFormat" name="outputFormat">
+          <option value="pdf">PDF (redacted, same layout)</option>
+          <option value="text">Plain text</option>
+        </select>
+
+        <button id="submitButton" type="submit">Redact</button>
+      </form>
+
+      <div id="progress">
+        <div class="spinner"></div>
+        <span id="progressText">Redacting…</span>
+      </div>
+
+      <div id="error"></div>
+
+      <div id="result">
+        <p id="summary"></p>
+        <a id="downloadLink" href="#">Download redacted file</a>
+      </div>
+
+    <h2>API instructions</h2>
+    <ul id="endpoints">
+      <li>POST /api/v1/redact/ with multipart/form-data: file, outputFormat (pdf|text)</li>
+      <li>GET /api/v1/download/&lt;jobId&gt; -- one-time-use download link returned by the above</li>
+    </ul>
+
+    <script>
+      const fileInput = document.getElementById('fileInput');
+      const outputFormat = document.getElementById('outputFormat');
+
+      // .txt input can only ever produce .txt output -- keep the select in sync.
+      fileInput.addEventListener('change', () => {
+        const name = fileInput.files[0] ? fileInput.files[0].name.toLowerCase() : '';
+        if (name.endsWith('.txt')) {
+          outputFormat.value = 'text';
+          outputFormat.disabled = true;
+        } else {
+          outputFormat.disabled = false;
+        }
+      });
+
+      const submitButton = document.getElementById('submitButton');
+      const progressDiv = document.getElementById('progress');
+      const progressText = document.getElementById('progressText');
+      let progressTimer = null;
+
+      function startProgress() {
+        submitButton.disabled = true;
+        fileInput.disabled = true;
+        outputFormat.disabled = true;
+        const startedAt = Date.now();
+        progressText.textContent = 'Redacting… (0s)';
+        progressDiv.classList.add('visible');
+        // A real, ticking elapsed-time counter -- not just a spinner -- so it's still
+        // provably alive even if animations are off (prefers-reduced-motion) or the
+        // spinner itself silently stalls. OCR + model inference on scanned PDFs can
+        // take a while, so this is the "still working, not frozen" signal.
+        progressTimer = setInterval(() => {
+          const secs = Math.round((Date.now() - startedAt) / 1000);
+          progressText.textContent = `Redacting… (${secs}s)`;
+        }, 1000);
+      }
+
+      function stopProgress() {
+        clearInterval(progressTimer);
+        progressTimer = null;
+        progressDiv.classList.remove('visible');
+        submitButton.disabled = false;
+        fileInput.disabled = false;
+        outputFormat.disabled = fileInput.files[0]
+          ? fileInput.files[0].name.toLowerCase().endsWith('.txt')
+          : false;
+      }
+
+      document.getElementById('uploadForm').addEventListener('submit', async (event) => {
+        event.preventDefault();
+
+        const errorDiv = document.getElementById('error');
+        const resultDiv = document.getElementById('result');
+        errorDiv.classList.remove('visible');
+        resultDiv.classList.remove('visible');
+
+        const formData = new FormData(event.target);
+        startProgress();
+
+        try {
+          const response = await fetch(`${location.origin}/api/v1/redact/`, {
+            method: 'POST',
+            body: formData,
+          });
+          const body = await response.json();
+
+          if (!response.ok) {
+            errorDiv.textContent = 'Error: ' + (body.error || response.statusText);
+            errorDiv.classList.add('visible');
+            return;
+          }
+
+          const counts = Object.entries(body.entityCounts || {})
+            .map(([category, n]) => `${category} ×${n}`)
+            .join(', ') || 'none found';
+          let summary = `Redacted: ${counts}.`;
+          if (body.ocrPages && body.ocrPages.length) {
+            summary += ` OCR was used on pages: ${body.ocrPages.join(', ')}.`;
+          }
+          if (body.skippedPages && body.skippedPages.length) {
+            summary += ` Skipped pages (no extractable text, even after OCR): ${body.skippedPages.join(', ')}.`;
+          }
+          document.getElementById('summary').textContent = summary;
+          document.getElementById('downloadLink').href = body.downloadUrl;
+          resultDiv.classList.add('visible');
+        } catch (e) {
+          errorDiv.textContent = 'Error: ' + e;
+          errorDiv.classList.add('visible');
+        } finally {
+          stopProgress();
+        }
+      });
+    </script>
+  </body>
+</html>

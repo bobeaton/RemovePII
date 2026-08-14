@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments -- e.g. if you ever run `pip install -r requirements.txt`
+# locally (outside Docker) to test/debug, rather than only inside the image build.
+venv/
+.venv/
+env/
+ENV/
+
+# pip build artifacts
+pip-wheel-metadata/
+
+# Secrets / local env overrides -- e.g. a local HF_TOKEN. Never commit real secrets;
+# keep them in your shell environment or an untracked .env file instead.
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code local project state (lock files, session state -- not shared config)
+.claude/
+
+# Misc local artifacts
+*.log

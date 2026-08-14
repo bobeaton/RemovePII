@@ -1,0 +1,16 @@
+# openai/privacy-filter's architecture (openai_privacy_filter) isn't supported by any
+# released PyPI version of transformers yet -- install straight from GitHub main branch.
+# NOTE: this floats on unreleased/unstable code; switch back to a pinned PyPI release
+# (e.g. `transformers>=X.Y.Z`) once one ships official support for this model.
+git+https://github.com/huggingface/transformers.git
+
+# torch/torchvision/torchaudio are NOT listed here -- they're installed separately in the
+# Dockerfile from PyTorch's CPU-only wheel index (matches this project's DEVICE=-1 default
+# in settings.py, and avoids bundling ~1-2GB of unused CUDA runtime libraries). See the
+# Dockerfile comment there for how to switch to a GPU build instead.
+
+protobuf
+pymupdf
+flask
+gevent
+werkzeug
