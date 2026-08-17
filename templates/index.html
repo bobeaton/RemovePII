@@ -104,25 +104,52 @@
           <option value="text">Plain text</option>
         </select>
 
+        <label for="customTerms">
+          Also redact these exact strings (one per line, optional) -- a guarantee
+          regardless of what the model detects, e.g. anything you already know is in
+          the document and want redacted for certain
+        </label>
+        <textarea id="customTerms" name="customTerms" rows="3"
+                  placeholder="e.g. one known value per line"></textarea>
+
         <button id="submitButton" type="submit">Redact</button>
       </form>
 
       <div id="progress">
         <div class="spinner"></div>
-        <span id="progressText">Redacting…</span>
+        <span id="progressText">Working…</span>
       </div>
 
       <div id="error"></div>
 
       <div id="result">
         <p id="summary"></p>
-        <a id="downloadLink" href="#">Download redacted file</a>
+        <a id="downloadLink" href="#">Download file</a>
       </div>
+
+      <h2>OCR review checkpoint</h2>
+      <p>
+        For a scanned/image-only PDF, this converts each image-only page into real,
+        searchable text at roughly its original layout -- <strong>no redaction happens
+        here</strong>. Nothing is guaranteed found or fixed automatically; it exists so
+        you can open the result in a normal PDF viewer, search it or read it to check
+        what OCR actually saw, and even hand-correct misreads, before running it through
+        Redact above as an ordinary PDF.
+      </p>
+      <form id="flattenForm">
+        <label for="flattenFileInput">PDF to convert (.pdf)</label>
+        <input type="file" id="flattenFileInput" name="file" accept=".pdf" required />
+        <button id="flattenSubmitButton" type="submit">Convert to searchable text</button>
+      </form>
 
     <h2>API instructions</h2>
     <ul id="endpoints">
-      <li>POST /api/v1/redact/ with multipart/form-data: file, outputFormat (pdf|text)</li>
-      <li>GET /api/v1/download/&lt;jobId&gt; -- one-time-use download link returned by the above</li>
+      <li>POST /api/v1/redact/ with multipart/form-data: file, outputFormat (pdf|text),
+        customTerms (optional, one exact string per line)</li>
+      <li>POST /api/v1/ocr-flatten/ with multipart/form-data: file (.pdf) -- OCR review
+        checkpoint, does not redact</li>
+      <li>GET /api/v1/download/&lt;jobId&gt; -- one-time-use download link returned by
+        either of the above</li>
     </ul>
 
     <script>
@@ -140,17 +167,16 @@
         }
       });
 
-      const submitButton = document.getElementById('submitButton');
       const progressDiv = document.getElementById('progress');
       const progressText = document.getElementById('progressText');
+      const errorDiv = document.getElementById('error');
+      const resultDiv = document.getElementById('result');
       let progressTimer = null;
 
-      function startProgress() {
-        submitButton.disabled = true;
-        fileInput.disabled = true;
-        outputFormat.disabled = true;
+      function startProgress(label, disable) {
+        disable.forEach((el) => { el.disabled = true; });
         const startedAt = Date.now();
-        progressText.textContent = 'Redacting… (0s)';
+        progressText.textContent = `${label}… (0s)`;
         progressDiv.classList.add('visible');
         // A real, ticking elapsed-time counter -- not just a spinner -- so it's still
         // provably alive even if animations are off (prefers-reduced-motion) or the
@@ -158,34 +184,33 @@
         // take a while, so this is the "still working, not frozen" signal.
         progressTimer = setInterval(() => {
           const secs = Math.round((Date.now() - startedAt) / 1000);
-          progressText.textContent = `Redacting… (${secs}s)`;
+          progressText.textContent = `${label}… (${secs}s)`;
         }, 1000);
       }
 
-      function stopProgress() {
+      function stopProgress(disable) {
         clearInterval(progressTimer);
         progressTimer = null;
         progressDiv.classList.remove('visible');
-        submitButton.disabled = false;
-        fileInput.disabled = false;
+        disable.forEach((el) => { el.disabled = false; });
         outputFormat.disabled = fileInput.files[0]
           ? fileInput.files[0].name.toLowerCase().endsWith('.txt')
           : false;
       }
 
-      document.getElementById('uploadForm').addEventListener('submit', async (event) => {
+      // Shared by both forms: POST formData to url, show progress while in flight,
+      // then hand the parsed response body to buildSummary(body) to fill in #summary
+      // on success. disable is the list of inputs/buttons to lock during the request.
+      async function submitForm(event, url, label, disable, buildSummary) {
         event.preventDefault();
-
-        const errorDiv = document.getElementById('error');
-        const resultDiv = document.getElementById('result');
         errorDiv.classList.remove('visible');
         resultDiv.classList.remove('visible');
 
         const formData = new FormData(event.target);
-        startProgress();
+        startProgress(label, disable);
 
         try {
-          const response = await fetch(`${location.origin}/api/v1/redact/`, {
+          const response = await fetch(`${location.origin}${url}`, {
             method: 'POST',
             body: formData,
           });
@@ -197,6 +222,21 @@
             return;
           }
 
+          document.getElementById('summary').textContent = buildSummary(body);
+          document.getElementById('downloadLink').href = body.downloadUrl;
+          resultDiv.classList.add('visible');
+        } catch (e) {
+          errorDiv.textContent = 'Error: ' + e;
+          errorDiv.classList.add('visible');
+        } finally {
+          stopProgress(disable);
+        }
+      }
+
+      const submitButton = document.getElementById('submitButton');
+      const customTerms = document.getElementById('customTerms');
+      document.getElementById('uploadForm').addEventListener('submit', (event) =>
+        submitForm(event, '/api/v1/redact/', 'Redacting', [submitButton, fileInput, outputFormat, customTerms], (body) => {
           const counts = Object.entries(body.entityCounts || {})
             .map(([category, n]) => `${category} ×${n}`)
             .join(', ') || 'none found';
@@ -207,16 +247,19 @@
           if (body.skippedPages && body.skippedPages.length) {
             summary += ` Skipped pages (no extractable text, even after OCR): ${body.skippedPages.join(', ')}.`;
           }
-          document.getElementById('summary').textContent = summary;
-          document.getElementById('downloadLink').href = body.downloadUrl;
-          resultDiv.classList.add('visible');
-        } catch (e) {
-          errorDiv.textContent = 'Error: ' + e;
-          errorDiv.classList.add('visible');
-        } finally {
-          stopProgress();
-        }
-      });
+          return summary;
+        })
+      );
+
+      const flattenFileInput = document.getElementById('flattenFileInput');
+      const flattenSubmitButton = document.getElementById('flattenSubmitButton');
+      document.getElementById('flattenForm').addEventListener('submit', (event) =>
+        submitForm(event, '/api/v1/ocr-flatten/', 'Converting', [flattenSubmitButton, flattenFileInput], (body) => {
+          return body.flattenedPages && body.flattenedPages.length
+            ? `Converted pages to searchable text: ${body.flattenedPages.join(', ')}. No redaction was performed -- review before redacting.`
+            : 'No image-only pages found -- nothing needed converting.';
+        })
+      );
     </script>
   </body>
 </html>

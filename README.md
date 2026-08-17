@@ -57,6 +57,14 @@ python -m pip install -r requirements.txt
 - `file` -- a `.txt` or `.pdf` file (required)
 - `outputFormat` -- `pdf` or `text` (optional; defaults to `pdf` for PDF input, `text` for
   text input; `.txt` input can only produce `text` output)
+- `customTerms` -- optional, one exact string per line. Each is redacted everywhere it
+  appears (case-insensitive, literal substring match, not a regex), *in addition to*
+  whatever the model detects -- a guarantee, not a suggestion. Useful for a specific known
+  value the model missed (e.g. a short state abbreviation) or anything else you want
+  redacted for certain regardless of model confidence. Reported back under the generic
+  `custom_match` category in `entityCounts` -- never the matched value itself. Capped at
+  `MAX_CUSTOM_TERMS` entries of at most `MAX_CUSTOM_TERM_LENGTH` characters each (see
+  `settings.py`).
 
 Returns JSON:
 ```json
@@ -78,11 +86,48 @@ left unredacted.
 Example:
 ```powershell
 curl -F "file=@sample.pdf" -F "outputFormat=text" http://localhost:8142/api/v1/redact/
+curl -F "file=@sample.pdf" -F "customTerms=Jane Doe
+123-45-6789" http://localhost:8142/api/v1/redact/
+```
+
+### `POST /api/v1/ocr-flatten/`
+
+`multipart/form-data` with `file` -- a `.pdf` only.
+
+**Does not redact anything.** For every image-only region of the PDF, OCRs it and reinserts
+the recognized text as real, searchable text at roughly its original position, removing the
+underlying image pixels there -- non-text graphical elements (borders, logos, checkbox
+glyphs, grid lines) are left alone, since only what OCR/native extraction recognized as a
+*word* gets touched. This exists as a human review/correction checkpoint between OCR and
+redaction: open the result in any ordinary PDF viewer, search it, visually check for OCR
+misreads, even hand-correct them, then feed it into `POST /api/v1/redact/` as an ordinary
+(now native-text) PDF. A straight second automatic redaction pass on the untouched output
+isn't expected to catch more PII by itself, since the classifier would see essentially the
+same reconstructed text and context either way -- the value here is the review/correction
+step, not a second detection attempt.
+
+Returns JSON:
+```json
+{
+  "jobId": "…",
+  "downloadUrl": "/api/v1/download/…",
+  "flattenedPages": [0]
+}
+```
+
+`flattenedPages` lists page numbers (0-indexed) that had at least one image and got
+converted; pages that were already native text, or had no images at all, are left completely
+untouched and won't appear here.
+
+Example:
+```powershell
+curl -F "file=@scanned.pdf" http://localhost:8142/api/v1/ocr-flatten/
 ```
 
 ### `GET /api/v1/download/<jobId>`
 
-Streams the redacted file back with the correct filename and content type. **One-time-use**:
+Streams the resulting file back (from either endpoint above) with the correct filename and
+content type. **One-time-use**:
 the file is deleted from the server immediately after being served, so a second request for
 the same `jobId` returns `404`. Jobs that are never downloaded are automatically cleaned up
 after `JOB_TTL_SECONDS` (see `settings.py`).
@@ -90,9 +135,10 @@ after `JOB_TTL_SECONDS` (see `settings.py`).
 ## Configuration
 
 See `settings.py` for `API_KEY` (optional `Authorization` header auth), `PORT`, `DEVICE`
-(CPU/GPU), `PII_PLACEHOLDER`, upload size limits, job cleanup timing, and `ENABLE_OCR` /
+(CPU/GPU), `PII_PLACEHOLDER`, upload size limits, job cleanup timing, `ENABLE_OCR` /
 `OCR_LANGUAGE` / `OCR_DPI` (OCR fallback for image-only PDF pages -- can be turned off if
-not needed; disabling it also skips the extra per-page image-detection check).
+not needed; disabling it also skips the extra per-page image-detection check), and
+`MAX_CUSTOM_TERMS` / `MAX_CUSTOM_TERM_LENGTH` (caps on the `customTerms` request field).
 
 `HF_TOKEN` (optional) -- `openai/privacy-filter` is public, so this is never required. If
 you have a Hugging Face token, set it in your shell environment before building/running and

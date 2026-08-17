@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import uuid
 import threading
@@ -12,7 +13,8 @@ from gevent.pywsgi import WSGIServer
 
 from settings import (MODEL_NAME, PORT, API_KEY, DEVICE, PII_PLACEHOLDER,
                        ALLOWED_EXTENSIONS, MAX_CONTENT_LENGTH, JOBS_DIR, JOB_TTL_SECONDS,
-                       ENABLE_OCR, OCR_LANGUAGE, OCR_DPI, MAX_TEXT_CHUNK_CHARS)
+                       ENABLE_OCR, OCR_LANGUAGE, OCR_DPI, MAX_TEXT_CHUNK_CHARS,
+                       MAX_CUSTOM_TERMS, MAX_CUSTOM_TERM_LENGTH)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
@@ -131,9 +133,27 @@ def chunk_text(text, max_chars=MAX_TEXT_CHUNK_CHARS):
     return chunks
 
 
+def expand_to_word_boundaries(text, start, end):
+    """Expand [start, end) to the boundaries of the whitespace-delimited token(s) it
+    touches. Mirrors the safety margin the PDF box-drawing path already gets for free
+    (map_entity_to_rects grabs every PyMuPDF/OCR *word* overlapping an entity, not just
+    its raw char span) -- without this, a low-confidence or boundary-clipped entity span
+    can leave a partial word fragment unredacted in any text-based output (a plain .txt
+    upload, or a PDF's outputFormat=text), even though the same detection redacts the
+    whole word cleanly when drawn as a box on a PDF page. Observed concretely: a street
+    address's tail end ('y Dr') survived in text output from an entity that only
+    matched '...Romanwa' at the character level."""
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    while end < len(text) and not text[end].isspace():
+        end += 1
+    return start, end
+
+
 def run_redactor(text):
     """Run the PII classifier on `text`, returning a flat list of raw (unmerged)
-    entities in `text`'s own coordinate space. Chunks first if `text` is long: a single
+    entities in `text`'s own coordinate space, each expanded to whole-word boundaries
+    (see expand_to_word_boundaries). Chunks first if `text` is long: a single
     ~465KB/68k-word document was observed to crash the whole server process (SIGKILL,
     out of memory) when sent to the classifier in one call -- likely attention memory
     scaling with sequence length -- so anything over MAX_TEXT_CHUNK_CHARS is split into
@@ -146,20 +166,37 @@ def run_redactor(text):
     entities = []
     for (chunk, offset), result in zip(chunks, batch):
         for e in result:
-            entities.append({
-                'entity_group': e['entity_group'],
-                'start': e['start'] + offset,
-                'end': e['end'] + offset,
-            })
+            start, end = expand_to_word_boundaries(text, e['start'] + offset, e['end'] + offset)
+            entities.append({'entity_group': e['entity_group'], 'start': start, 'end': end})
     return entities
 
 
-def redact_text(text):
-    """Run the PII classifier on a plain text string and splice in PII_PLACEHOLDER for
-    every detected entity span. Returns (redacted_text, entity_counts) where
-    entity_counts maps entity_group -> number of occurrences (for logging/feedback only
-    -- never includes the actual PII values)."""
-    entities = merge_adjacent_entities(run_redactor(text), text)
+def find_entities(text, custom_terms=None):
+    """Combine the model's detections (via run_redactor -- already chunked and expanded
+    to word boundaries) with any custom_terms exact-match entities, so both flow
+    through the same merge/redaction pipeline uniformly. custom_terms are matched
+    case-insensitively as literal substrings (not regexes) -- a guarantee for specific
+    known PII values the caller wants redacted regardless of model confidence (e.g. a
+    short state abbreviation the model didn't tag, or anything else known in advance).
+    Reported under the generic 'custom_match' category -- never the matched value
+    itself -- consistent with never exposing actual PII values in counts/logs."""
+    entities = run_redactor(text)
+    if custom_terms:
+        for term in custom_terms:
+            if not term:
+                continue
+            for m in re.finditer(re.escape(term), text, re.IGNORECASE):
+                start, end = expand_to_word_boundaries(text, m.start(), m.end())
+                entities.append({'entity_group': 'custom_match', 'start': start, 'end': end})
+    return entities
+
+
+def redact_text(text, custom_terms=None):
+    """Run the PII classifier (plus any custom_terms exact matches) on a plain text
+    string and splice in PII_PLACEHOLDER for every detected entity span. Returns
+    (redacted_text, entity_counts) where entity_counts maps entity_group -> number of
+    occurrences (for logging/feedback only -- never includes the actual PII values)."""
+    entities = merge_adjacent_entities(find_entities(text, custom_terms), text)
     counts = {}
     for e in entities:
         counts[e['entity_group']] = counts.get(e['entity_group'], 0) + 1
@@ -272,6 +309,41 @@ def build_page_text_and_wordmap(page):
     return ''.join(parts), spans, used_ocr
 
 
+def flatten_page_to_text(page):
+    """Replace every recognized word's image-region on this page with the same word
+    re-inserted as real, searchable text at roughly its original position -- leaving
+    non-text graphical elements (borders, logos, checkbox glyphs, grid lines) alone,
+    since only whatever OCR/native extraction recognized as a *word* gets touched.
+
+    This does NOT redact anything. It's a human review/correction checkpoint between
+    OCR and redaction: a straight second automatic redaction pass on this output isn't
+    expected to catch more PII than a single pass already does, since the classifier
+    would see essentially the same reconstructed text and context either way -- the
+    real value is that the result can be opened in any ordinary PDF viewer, searched,
+    visually checked for OCR misreads, or even hand-corrected, before being fed into
+    /api/v1/redact/ as an ordinary (now native-text) PDF.
+
+    Returns True if anything was flattened on this page (pages with no images, or where
+    OCR contributed nothing beyond native text, are left completely untouched)."""
+    if not (ENABLE_OCR and page.get_images()):
+        return False
+    text, word_spans, used_ocr = build_page_text_and_wordmap(page)
+    if not used_ocr or not text.strip():
+        return False
+    seen = set()
+    for (start, end, x0, y0, x1, y1, line_idx, word_idx) in word_spans:
+        word = text[start:end]
+        if not word.strip():
+            continue
+        key = (round(x0, 1), round(y0, 1), round(x1, 1), round(y1, 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        page.add_redact_annot(fitz.Rect(x0, y0, x1, y1), text=word, fill=(1, 1, 1), text_color=(0, 0, 0))
+    page.apply_redactions()
+    return True
+
+
 def map_entity_to_rects(entity, word_spans):
     """Map one entity's [start, end) character span back to one or more page rects.
     Words are matched by overlap (not strict containment) so a boundary-clipped entity
@@ -300,7 +372,7 @@ def map_entity_to_rects(entity, word_spans):
     return rects
 
 
-def redact_pdf(doc):
+def redact_pdf(doc, custom_terms=None):
     """Redact every page of an open PyMuPDF document in place. Pages with no
     extractable text at all -- even after an OCR attempt -- are skipped entirely: not
     sent to the model, never redacted -- and reported back in skipped_pages. Pages
@@ -324,13 +396,14 @@ def redact_pdf(doc):
         if not text.strip():
             skipped_pages.append(page.number)
 
-    # run_redactor() chunks internally if a page's text is unusually long (see
-    # MAX_TEXT_CHUNK_CHARS) -- defense in depth against the same crash .txt uploads hit,
-    # in case a single PDF page ever has an enormous amount of text on it.
+    # run_redactor() (inside find_entities()) chunks internally if a page's text is
+    # unusually long (see MAX_TEXT_CHUNK_CHARS) -- defense in depth against the same
+    # crash .txt uploads hit, in case a single PDF page ever has an enormous amount of
+    # text on it.
     results_by_page = {i: [] for i in range(len(page_texts))}
     for idx, text in enumerate(page_texts):
         if text.strip():
-            results_by_page[idx] = merge_adjacent_entities(run_redactor(text), text)
+            results_by_page[idx] = merge_adjacent_entities(find_entities(text, custom_terms), text)
 
     page_redacted_texts = list(page_texts)
 
@@ -395,6 +468,14 @@ def redact():
         if ext == 'txt' and output_format == 'pdf':
             return jsonify({'error': 'outputFormat=pdf is not supported for .txt input'}), 400
 
+        # Optional: exact strings (one per line) to redact in addition to whatever the
+        # model detects -- a guarantee, not a suggestion. See find_entities().
+        custom_terms = [t.strip() for t in request.form.get('customTerms', '').splitlines() if t.strip()]
+        if len(custom_terms) > MAX_CUSTOM_TERMS:
+            return jsonify({'error': f'Too many customTerms entries (max {MAX_CUSTOM_TERMS})'}), 400
+        if any(len(t) > MAX_CUSTOM_TERM_LENGTH for t in custom_terms):
+            return jsonify({'error': f'Each customTerms entry must be at most {MAX_CUSTOM_TERM_LENGTH} characters'}), 400
+
         data = f.read()
         if len(data) == 0:
             return jsonify({'error': 'Uploaded file is empty'}), 400
@@ -405,7 +486,7 @@ def redact():
 
         if ext == 'txt':
             text = data.decode('utf-8', errors='replace')
-            redacted_text, counts = redact_text(text)
+            redacted_text, counts = redact_text(text, custom_terms)
             out_path = os.path.join(JOBS_DIR, f'{job_id}.txt')
             with open(out_path, 'w', encoding='utf-8') as fh:
                 fh.write(redacted_text)
@@ -423,7 +504,7 @@ def redact():
                 doc.close()
                 return jsonify({'error': 'PDF has no pages'}), 400
 
-            counts, skipped_pages, ocr_pages, page_redacted_texts = redact_pdf(doc)
+            counts, skipped_pages, ocr_pages, page_redacted_texts = redact_pdf(doc, custom_terms)
 
             if output_format == 'pdf':
                 out_path = os.path.join(JOBS_DIR, f'{job_id}.pdf')
@@ -449,9 +530,11 @@ def redact():
                 'created_at': time.time(),
             }
 
-        # Only log category counts and structural info -- never the actual PII values.
+        # Only log category counts and structural info -- never the actual PII values
+        # (that includes customTerms -- log a count, not the terms themselves).
         app.logger.info(f"job {job_id}: type={ext} entity_counts={counts} "
-                         f"skipped_pages={skipped_pages} ocr_pages={ocr_pages}")
+                         f"skipped_pages={skipped_pages} ocr_pages={ocr_pages} "
+                         f"custom_terms={len(custom_terms)}")
 
         return jsonify({
             'jobId': job_id,
@@ -470,6 +553,70 @@ def redact():
         app.logger.exception('Unhandled error while processing redaction request')
         # Deliberately generic -- not str(e) -- since an exception message could
         # inadvertently echo a fragment of file content.
+        return jsonify({'error': 'Internal server error while processing file'}), 500
+
+
+@app.route('/api/v1/ocr-flatten/', methods=['POST'])
+def ocr_flatten():
+    """OCR every image-only region of an uploaded PDF and reinsert the recognized text
+    as real, searchable text at roughly its original position, removing the underlying
+    image pixels there. No redaction happens here -- see flatten_page_to_text() for why
+    this is a review/correction checkpoint rather than a way to improve detection."""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': "Missing 'file' part in form-data"}), 400
+
+        f = request.files['file']
+        if f.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+
+        filename = secure_filename(f.filename)
+        if not filename.lower().endswith('.pdf'):
+            return jsonify({'error': 'Only .pdf files are supported for OCR flattening'}), 400
+
+        data = f.read()
+        if len(data) == 0:
+            return jsonify({'error': 'Uploaded file is empty'}), 400
+
+        try:
+            doc = fitz.open(stream=data, filetype='pdf')
+        except Exception:
+            return jsonify({'error': 'Could not read PDF file (it may be corrupt or unsupported)'}), 400
+
+        if doc.needs_pass:
+            doc.close()
+            return jsonify({'error': 'PDF is password protected'}), 400
+        if doc.page_count == 0:
+            doc.close()
+            return jsonify({'error': 'PDF has no pages'}), 400
+
+        flattened_pages = [page.number for page in doc if flatten_page_to_text(page)]
+
+        job_id = uuid.uuid4().hex
+        out_path = os.path.join(JOBS_DIR, f'{job_id}.pdf')
+        doc.save(out_path, garbage=4, deflate=True)
+        doc.close()
+
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                'file_path': out_path,
+                'filename': f'flattened_{filename}',
+                'mimetype': 'application/pdf',
+                'created_at': time.time(),
+            }
+
+        app.logger.info(f"job {job_id}: ocr-flatten flattened_pages={flattened_pages}")
+
+        return jsonify({
+            'jobId': job_id,
+            'downloadUrl': f'/api/v1/download/{job_id}',
+            'flattenedPages': flattened_pages,
+        })
+
+    except HTTPException:
+        raise
+    except Exception:
+        app.logger.exception('Unhandled error while flattening PDF')
         return jsonify({'error': 'Internal server error while processing file'}), 500
 
 

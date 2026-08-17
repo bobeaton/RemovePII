@@ -68,3 +68,11 @@ OCR_DPI = 300
 # safe practical bound, per the crash above -- and roughly page-sized, matching what
 # the PDF path already handles reliably one page at a time.
 MAX_TEXT_CHUNK_CHARS = 3000
+
+# Optional caller-supplied list of exact strings to redact in addition to whatever the
+# model detects -- a guarantee, not a suggestion: useful for known PII values the model
+# missed (e.g. a short state abbreviation) or anything you specifically want redacted
+# regardless of model confidence. Matched case-insensitively as a literal substring
+# (not a regex). Capped to keep worst-case cost (terms x document length) bounded.
+MAX_CUSTOM_TERMS = 200
+MAX_CUSTOM_TERM_LENGTH = 200
